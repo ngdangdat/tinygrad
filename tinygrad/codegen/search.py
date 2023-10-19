@@ -1,82 +1,81 @@
-from typing import Callable
-import time
+from typing import Dict, List, cast, DefaultDict, Optional
+from copy import deepcopy
+from tinygrad.lazy import vars_from_ast
+from tinygrad.ops import Device, Compiled, MemBuffer
+from tinygrad.helpers import prod, getenv, flatten
 from tinygrad.codegen.linearizer import Linearizer
-from tinygrad.helpers import DEBUG, prod, getenv
+from tinygrad.runtime.lib import RawBuffer
+from collections import defaultdict
 
-def get_divisors(n, min_div = 1, max_div = 512):
-  if min_div > 1: yield 1
-  for d in range(min_div, min(max_div, n//2) + 1):
-    if n % d == 0: yield d
+from tinygrad.codegen.optimizer import Opt, OptOps
+actions = flatten([[Opt(op=OptOps.UPCAST, axis=axis, amt=amt) for amt in [0,2,3,4,7]] for axis in range(6)])
+actions += flatten([[Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,4]] for axis in range(4)])
+actions += flatten([[Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,16]] for axis in range(5)])
+actions += [
+  Opt(op=OptOps.LOCAL, axis=0, amt=32),
+  Opt(op=OptOps.GROUP, axis=1, amt=4), Opt(op=OptOps.GROUP, axis=1, amt=8), Opt(op=OptOps.GROUP, axis=2, amt=8),
+  Opt(op=OptOps.GROUPTOP, axis=0, amt=16), Opt(op=OptOps.GROUPTOP, axis=0, amt=256),
+  Opt(op=OptOps.GROUPTOP, axis=1, amt=16), Opt(op=OptOps.GROUPTOP, axis=1, amt=256),
+  Opt(op=OptOps.GROUPTOP, axis=2, amt=16), Opt(op=OptOps.GROUPTOP, axis=2, amt=256)
+]
+device:Compiled = cast(Compiled, Device[Device.DEFAULT])
 
-def kernel_optimize_opts(k:Linearizer):
-  import nevergrad as ng
-  opts = []
-  for i in range(k.first_reduce):
-    # TODO: the upcast always happen first, you might want to reverse this?
-    # TODO: the order of the locals might improve things too
-    opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=8)]))
-    opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i], min_div=4)]))
-  for i in range(k.shape_len-k.first_reduce):
-    opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=8)]))
-    opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
-  return opts
+# returns time in seconds
+logtm = open(getenv("LOGTM", ""),"a") if getenv("LOGTM", "") else None
+def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=True, max_global_size=65536, cnt=3, should_copy=True) -> float:
+  if should_copy: lin = deepcopy(lin)  # TODO: remove the need for this
+  var_vals = {k:k.min for k in vars_from_ast(lin.ast)}
+  try:
+    lin.linearize()
+    prg = device.to_program(lin)
+    real_global_size = prg.global_size[:]
+    if allow_test_size:
+      test_global_size = prg.global_size[:]
+      while prod(test_global_size) > max_global_size:
+        for j in range(2,-1,-1):
+          if test_global_size[j] > 16:
+            test_global_size[j] //= 2
+            break
+      factor = prod(prg.global_size) / prod(test_global_size)
+      prg.global_size = test_global_size
+      #print(real_global_size, test_global_size, factor)
+    else:
+      factor = 1
+    tms = [prg(rawbufs, var_vals, force_wait=True)*factor for _ in range(cnt)]
+    prg.global_size = real_global_size
+  except Exception:
+    #print("FAILED")
+    #print(lin.ast)
+    #print(lin.applied_opts)
+    tms = [float('inf')]
+  if logtm: logtm.write(str((lin.ast, lin.applied_opts, tms))+"\n")
+  return min(tms)
 
-def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, baseline):
-  import nevergrad as ng
-  def opt(x):
+# get (scrap) buffers for timing the linearizer
+def bufs_from_lin(lin:Linearizer) -> List[RawBuffer]:
+  bufsts:DefaultDict[int, List[MemBuffer]] = defaultdict(list)
+  for x in lin.membufs: bufsts[x.idx].append(x)
+  rawbufs:List[Optional[RawBuffer]] = [None]*len(bufsts)
+  for k,lx in bufsts.items():
+    rawbufs[k] = device.buffer(max(y.st.size() for y in lx), lx[0].dtype)
+  assert all(r is not None for r in rawbufs)
+  return cast(List[RawBuffer], rawbufs)
+
+# get dictionary of all possible actions
+def get_linearizer_actions(lin:Linearizer) -> Dict[int, Linearizer]:
+  acted_lins = {0:deepcopy(lin)}
+  for i,a in enumerate(actions):
+    if a.axis >= lin.shape_len: continue
+    if lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
+    lin2 = deepcopy(lin)
     try:
-      k = create_k()
-      k.process()
-      k.apply_auto_opt(x)
-      prg = to_prg(k)
-      first_tm = prg.exec(k.bufs, force_wait=True, optimizing=True)
-      if baseline*5 < first_tm*1000: return first_tm*1000  # very slow
-      tm = min([first_tm]+[prg.exec(k.bufs, force_wait=True, optimizing=True) for _ in range(2)])*1000
-      return tm
+      lin2.apply_opt(a)
+      up, lcl = 1, 1
+      for s,c in zip(lin2.full_shape, lin2.colors()):
+        if c in {"magenta", "yellow"}: up *= s
+        if c in {"cyan", "green", "white"}: lcl *= s
+      if up > 256 or lcl > 256: continue
+      acted_lins[i+1] = lin2
     except Exception:
-      if DEBUG >= 3:
-        import traceback
-        traceback.print_exc()
-      return 10000_000   # 10000 seconds is infinity
-  opts = kernel_optimize_opts(k)
-  if not opts: return "BASELINE"
-  search_space = prod([len(x.choices) for x in opts])
-  st = time.perf_counter()
-  budget = getenv("BUDGET", 200)
-  optimizer = ng.optimizers.NGOpt(parametrization=ng.p.Tuple(*opts), budget=min(search_space, budget))
-  recommendation = optimizer.minimize(opt)
-  et = time.perf_counter() - st
-  if DEBUG >= 1: print(f"optimizer({et:6.2f} s to search) space {search_space:8d} with tm {recommendation.loss:5.2f} ms vs baseline {baseline:5.2f} ms, a {baseline/recommendation.loss:5.2f}x gain : {k.colored_shape()}")
-  return recommendation.value if recommendation.loss < baseline else "BASELINE"
-
-# optimization
-global_db = None
-def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg):
-  global global_db
-
-  k.process()
-  skey = str(k.key)
-
-  if getenv("KOPT") == 2 and global_db is None:
-    import shelve
-    global_db = shelve.open("/tmp/kopt_cache")
-
-  if global_db is not None and skey in global_db:
-    choice = global_db[skey]
-  elif k.has_variable_shape():
-    # don't optimize variable shapes
-    choice = "BASELINE"
-  else:
-    # get baseline
-    def get_baseline():
-      k = create_k()
-      k.hand_coded_optimizations()
-      prg = to_prg(k)
-      return min([prg.exec(k.bufs, force_wait=True, optimizing=True) for _ in range(5)])*1000
-    choice = kernel_optimize_search(k, create_k, to_prg, get_baseline())
-    if global_db is not None:
-      global_db[skey] = choice
-      global_db.sync()
-
-  if choice == "BASELINE": k.hand_coded_optimizations()
-  else: k.apply_auto_opt(choice)
+      pass
+  return acted_lins

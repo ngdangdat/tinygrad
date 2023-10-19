@@ -1,8 +1,13 @@
 from __future__ import annotations
-import os, functools, platform, time, re, contextlib
+import os, functools, platform, time, re, contextlib, operator, pathlib, hashlib, tempfile
 import numpy as np
-from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Iterable, Any
-from math import prod # noqa: F401 # pylint:disable=unused-import
+from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Iterable, Any, TypeVar, TYPE_CHECKING
+if TYPE_CHECKING:  # TODO: remove this and import TypeGuard from typing once minimum python supported version is 3.10
+  from typing_extensions import TypeGuard
+
+T = TypeVar("T")
+# NOTE: it returns int 1 if x is empty regardless of the type of x
+def prod(x:Iterable[T]) -> Union[T,int]: return functools.reduce(operator.__mul__, x, 1)
 
 # NOTE: helpers is not allowed to import from anything else in tinygrad
 OSX = platform.system() == "Darwin"
@@ -12,10 +17,11 @@ def dedup(x): return list(dict.fromkeys(x))   # retains list order
 def argfix(*x): return tuple(x[0]) if x and x[0].__class__ in (tuple, list) else x
 def argsort(x): return type(x)(sorted(range(len(x)), key=x.__getitem__)) # https://stackoverflow.com/questions/3382352/equivalent-of-numpy-argsort-in-basic-python
 def all_same(items): return all(x == items[0] for x in items)
+def all_int(t: Tuple[Any, ...]) -> TypeGuard[Tuple[int, ...]]: return all(isinstance(s, int) for s in t)
 def colored(st, color, background=False): return f"\u001b[{10*background+60*(color.upper() == color)+30+['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'].index(color.lower())}m{st}\u001b[0m" if color is not None else st  # replace the termcolor library with one line
 def ansilen(s): return len(re.sub('\x1b\\[(K|.*?m)', '', s))
 def make_pair(x:Union[int, Tuple[int, ...]], cnt=2) -> Tuple[int, ...]: return (x,)*cnt if isinstance(x, int) else x
-def flatten(l:Iterator): return [item for sublist in l for item in sublist]
+def flatten(l:Union[List, Iterator]): return [item for sublist in l for item in sublist]
 def fromimport(mod, frm): return getattr(__import__(mod, fromlist=[frm]), frm)
 def strip_parens(fst): return fst[1:-1] if fst[0] == '(' and fst[-1] == ')' and fst[1:-1].find('(') <= fst[1:-1].find(')') else fst
 def merge_dicts(ds:Iterable[Dict]) -> Dict:
@@ -54,7 +60,7 @@ class ContextVar:
   def __lt__(self, x): return self.value < x
 
 DEBUG, IMAGE = ContextVar("DEBUG", 0), ContextVar("IMAGE", 0)
-GRAPH, PRUNEGRAPH, GRAPHPATH = getenv("GRAPH", 0), getenv("PRUNEGRAPH", 0), getenv("GRAPHPATH", "/tmp/net")
+GRAPH, GRAPHPATH = getenv("GRAPH", 0), getenv("GRAPHPATH", "/tmp/net")
 
 class Timing(contextlib.ContextDecorator):
   def __init__(self, prefix="", on_exit=None, enabled=True): self.prefix, self.on_exit, self.enabled = prefix, on_exit, enabled
@@ -71,7 +77,7 @@ class DType(NamedTuple):
   name: str
   np: Optional[type]  # TODO: someday this will be removed with the "remove numpy" project
   sz: int = 1
-  def __repr__(self): return f"dtypes.{self.name}"
+  def __repr__(self): return f"dtypes.{INVERSE_DTYPES_DICT[self]}"
 
 # dependent typing?
 class ImageDType(DType):
@@ -123,8 +129,15 @@ class dtypes:
   _float4: Final[DType] = DType(4, 4*4, "float4", None, 4)
   _arg_int32: Final[DType] = DType(2, 4, "_arg_int32", None)
 
+  # NOTE: these are image dtypes
+  @staticmethod
+  def imageh(shp): return ImageDType(100, 2, "imageh", np.float16, shp)
+  @staticmethod
+  def imagef(shp): return ImageDType(100, 4, "imagef", np.float32, shp)
+
 # HACK: staticmethods are not callable in 3.8 so we have to compare the class
 DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if not k.startswith('__') and not callable(v) and not v.__class__ == staticmethod}
+INVERSE_DTYPES_DICT = {v:k for k,v in DTYPES_DICT.items()}
 
 class GlobalCounters:
   global_ops: ClassVar[int] = 0
@@ -135,3 +148,14 @@ class GlobalCounters:
   mem_cached: ClassVar[int] = 0 # NOTE: this is not reset
   @staticmethod
   def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count = 0,0,0.0,0
+
+# *** compiled cache decorator ***
+
+def cache_compiled(func):
+  def wrapper(self, prg:str, *args, **kwargs) -> bytes:
+    cache_path, output_file = pathlib.Path(f"{tempfile.gettempdir()}/tinygrad_cc_{hashlib.sha256(prg.encode()).hexdigest()}"), pathlib.Path(tempfile.mktemp())
+    if not cache_path.exists():
+      output_file.write_bytes(func(self, prg, *args, **kwargs))
+      output_file.rename(cache_path)
+    return cache_path.read_bytes()
+  return wrapper
